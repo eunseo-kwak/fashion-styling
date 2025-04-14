@@ -1,0 +1,437 @@
+---
+title: "ds4420proj"
+output: html_document
+date: "2025-04-04"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# import necessary packages
+library(imager)
+library(dplyr)
+library(torch)
+library(caret)
+```
+```{r}
+# get file path of folder with all images usable for cnn
+image_folder <- "/Users/eunseokwak/Downloads/HM"
+
+# take files into list 
+image_files <- list.files(image_folder, pattern = "\\.jpg$", full.names = TRUE)
+```
+
+```{r}
+# create image processing function
+process_image <- function(file, target_width = 28, target_height = 28) {
+  # take image in
+  img <- load.image(file)
+  
+  # resize image to target dimensions 28x28
+  img <- resize(img, size_x = target_width, size_y = target_height)
+  
+  # make sure images are black and white 
+  if (spectrum(img) == 3) {
+    img <- grayscale(img)
+  }
+  
+  # make image vector 
+  as.vector(img)
+}
+
+# store results of extraction
+image_data_list <- lapply(image_files, function(file) {
+  # get image id using the file name format
+  image_id <- tools::file_path_sans_ext(basename(file))
+  
+  # get pixel vector using image processing
+  pixel_vector <- process_image(file)
+  
+  # create a df with a row for each picture's article id and pixels
+  # make it 1 row matrix with t(pixel_vector)
+  data.frame(article_id = image_id, t(pixel_vector), stringsAsFactors = FALSE)
+})
+
+# make df with all the images 
+df_pixels <- bind_rows(image_data_list)
+
+df_pixels <- df_pixels %>% 
+  mutate(article_id = as.numeric(article_id)) 
+
+df_pixels$article_id <- as.character(df_pixels$article_id)
+
+# check that format contains article id and pixel values 
+print(head(df_pixels))
+```
+
+```{r}
+# import csv of article id and article traits
+df_traits <- read.csv("/Users/eunseokwak/Downloads/articles.csv", stringsAsFactors = FALSE)
+
+# make article id numeric 
+df_traits <- df_traits %>% 
+  mutate(article_id = as.numeric(article_id)) %>% 
+  # only return article_ids greater than where the article_ids used starts 
+  filter(article_id > 930032000)
+
+# match article id format 
+df_traits$article_id <- as.character(df_traits$article_id)
+
+# join the dfs together using inner join on article_id
+df_joined <- inner_join(df_traits, df_pixels, by = "article_id")
+dim(df_joined)
+```
+
+```{r}
+# convert product type and graphical appearance using as.factor
+df_joined$product_type_name <- as.factor(df_joined$product_type_name)
+df_joined$graphical_appearance_name <- as.factor(df_joined$graphical_appearance_name)
+print(head(df_joined))
+```
+
+```{r}
+# define pixel values, skipping first 24 rows of article data 
+pixel_cols <- 26:(25 + 28*28)  
+
+# create subset of just the pixel columns
+pixel_df <- df_joined[, pixel_cols]
+
+# convert to matrix
+pixel_matrix <- as.matrix(pixel_df)
+
+# create tensor and reshape to match dimensions
+image_tensor <- torch_tensor(pixel_matrix, dtype = torch_float())$reshape(c(nrow(pixel_matrix), 1, 28, 28))
+```
+
+```{r}
+# label tensor for product type
+product_labels_tensor <- torch_tensor(df_joined$product_type_label, dtype = torch_long())
+
+# set random seed w 40 60 train test split 
+set.seed(32)
+train_idx <- createDataPartition(df_joined$graphical_label_new, p = 0.4, list = FALSE)
+test_idx <- setdiff(1:nrow(df_joined), train_idx)
+
+# split image tensor
+train_X <- image_tensor[train_idx, , , ]
+test_X  <- image_tensor[test_idx, , , ]
+
+# split label tensor
+train_product_y <- product_labels_tensor[train_idx]
+test_product_y  <- product_labels_tensor[test_idx]
+```
+
+
+```{r}
+# get count of product type classes
+num_product_classes <- length(unique(as_array(product_labels_tensor)))
+
+# set up cnn for product type 
+ProductCNN <- nn_module(
+  "ProductCNN",
+  initialize = function(num_classes) {
+    self$conv1 <- nn_conv2d(in_channels = 1, out_channels = 8, kernel_size = 3)  
+    self$pool <- nn_max_pool2d(kernel_size = 2, stride = 2) # add first pooling layer                    
+    self$conv2 <- nn_conv2d(in_channels = 8, out_channels = 16, kernel_size = 3) 
+    self$pool2 <- nn_max_pool2d(kernel_size = 2, stride = 2)  # add second pooling layer                 
+    self$fc1 <- nn_linear(in_features = 16 * 5 * 5, out_features = 256) # linear activation
+    self$fc2 <- nn_linear(in_features = 256, out_features = 512)
+    self$fc3 <- nn_linear(in_features = 512, out_features = num_classes)
+    self$relu <- nn_relu() # relu activation before output 
+  },
+  
+  forward = function(x) {
+    x <- self$relu(self$conv1(x))
+    x <- self$pool(x)
+    x <- self$relu(self$conv2(x))
+    x <- self$pool2(x)
+    x <- torch_flatten(x, start_dim = 2)
+    x <- self$relu(self$fc1(x))
+    x <- self$relu(self$fc2(x))
+    x <- self$fc3(x)
+    return(x)
+  }
+)
+
+# create on instance of product model
+product_model <- ProductCNN(num_product_classes)
+
+# set up loss and learning rate
+loss_fn_prod <- nn_cross_entropy_loss()
+optimizer_prod <- optim_sgd(product_model$parameters, lr = 0.055)
+
+# create dataset and dataloader 
+train_ds_product <- tensor_dataset(train_X, train_product_y)
+train_dl_product <- dataloader(train_ds_product, batch_size = 9, shuffle = TRUE)
+```
+
+```{r}
+# initialize mdodel
+# set epochs
+epochs <- 100
+
+# initialize loss and accuracy over epochs
+loss_history_prod <- numeric(epochs)
+accuracy_history_prod <- numeric(epochs)
+
+# save test labels to r array 
+test_product_y_arr <- as_array(test_product_y)
+
+for (epoch in 1:epochs) {
+  # initialize training mode 
+  product_model$train()
+  total_loss <- 0
+  
+  # Loop over training batches
+  coro::loop(for (batch in train_dl_product) {
+    optimizer_prod$zero_grad()
+    input <- batch[[1]]
+    target <- batch[[2]]
+    
+    # forward pass
+    output <- product_model(input)
+    
+    # compute loss and back prop
+    loss <- loss_fn_prod(output, target)
+    loss$backward()
+    
+    # update parameters
+    optimizer_prod$step()
+    
+    # find total loss 
+    total_loss <- total_loss + loss$item()
+  })
+  
+  # store avg training loss
+  avg_loss <- total_loss / length(train_dl_product)
+  loss_history_prod[epoch] <- avg_loss
+  
+  # create evaluation for current epoch
+  product_model$eval()
+  test_output <- product_model(test_X)
+  pred <- test_output$argmax(dim = 2)$squeeze()
+  
+  # calculate accuracy
+  accuracy <- mean(as_array(pred) == test_product_y_arr)
+  accuracy_history_prod[epoch] <- accuracy
+  
+  # print for each epoch
+  cat(sprintf("Epoch %d/%d - Loss: %.4f - Test Accuracy: %.4f\n", 
+              epoch, epochs, avg_loss, accuracy))
+}
+
+# side by side plot for loss and accuracy 
+par(mfrow = c(1, 2))
+plot(1:epochs, loss_history_prod, type = "b", col = "red",
+     xlab = "Epoch", ylab = "Loss", 
+     main = "Product Model Training Loss")
+plot(1:epochs, accuracy_history_prod, type = "b", col = "blue",
+     xlab = "Epoch", ylab = "Test Accuracy", 
+     main = "Product Model Test Accuracy")
+
+```
+
+```{r}
+# model outputs on test set
+final_output_prod <- product_model(test_X)
+
+# get predicted labels
+final_pred_prod <- final_output_prod$argmax(dim = 2)$squeeze()
+
+# convert predictions and true labels to R arrays
+final_pred_prod_arr <- as_array(final_pred_prod)
+test_product_y_arr <- as_array(test_product_y)
+
+# calculate accuracy
+final_accuracy_prod <- mean(final_pred_prod_arr == test_product_y_arr)
+
+# print final accuracy for graphical model
+cat(sprintf("Final Product Model Test Accuracy: %.4f\n", final_accuracy_prod))
+
+```
+
+```{r}
+# get counts for graphical appearance breakdown to make sure every category is represented at least 2x
+# in order to train test split 
+graphical_counts <- table(df_joined$graphical_label_new)
+
+# create barplot of graphical counts
+barplot(graphical_counts,
+        main = "Counts for Graphical Appearance Categories",
+        xlab = "Category (0-based)",
+        ylab = "Count",
+        col = "pink",
+        las = 1)
+
+# add cutoff line of h=1
+abline(h = 1, col = "black", lty = 2)
+```
+```{r}
+# calculate counts of each graphical label
+cat_counts <- table(df_joined$graphical_label_new)
+
+# find labels that only occur once 
+categories_to_drop <- as.numeric(names(cat_counts[cat_counts == 1]))
+
+# filter to get just the unaffected rows
+df_joined_filtered <- df_joined[!(df_joined$graphical_label_new %in% categories_to_drop), ]
+
+# print new counts for each of the categories
+new_counts <- table(df_joined_filtered$graphical_label_new)
+print(new_counts)
+```
+
+```{r}
+# CNN 2 - graphical categories
+# re-index raw labels to be continuous 
+df_joined_filtered$graphical_label_new <- as.integer(as.factor(df_joined_filtered$graphical_label_new)) 
+print(sort(unique(df_joined_filtered$graphical_label_new))) 
+
+# recreate image tensor on filtered dataset 
+pixel_df_filtered <- df_joined_filtered[, pixel_cols]
+pixel_matrix_filtered <- as.matrix(pixel_df_filtered)
+image_tensor_filtered <- torch_tensor(pixel_matrix_filtered, dtype = torch_float())$reshape(c(nrow(pixel_matrix_filtered), 1, 28, 28))
+
+# create label tensors
+graphical_labels_tensor_filtered <- torch_tensor(df_joined_filtered$graphical_label_new, dtype = torch_long())
+
+# use stratified train test split on 40/60 split 
+set.seed(32)
+train_idx <- createDataPartition(df_joined_filtered$graphical_label_new, p = 0.4, list = FALSE)
+test_idx  <- setdiff(1:nrow(df_joined_filtered), train_idx)
+
+# split filtered image tensor 
+train_X <- image_tensor_filtered[train_idx, , , ]
+test_X  <- image_tensor_filtered[test_idx, , , ]
+
+# split label tensors
+train_graphical_y <- graphical_labels_tensor_filtered[train_idx]
+test_graphical_y  <- graphical_labels_tensor_filtered[test_idx]
+
+# create cnn model
+GraphicalCNN <- nn_module(
+  "GraphicalCNN",
+  initialize = function(num_classes) {
+    self$conv1 <- nn_conv2d(in_channels = 1, out_channels = 8, kernel_size = 3) 
+    self$pool <- nn_max_pool2d(kernel_size = 2, stride = 2) # perform max pooling
+    self$conv2 <- nn_conv2d(in_channels = 8, out_channels = 16, kernel_size = 3)
+    self$pool2 <- nn_max_pool2d(kernel_size = 2, stride = 2) # perform max pooling
+    self$fc1 <- nn_linear(in_features = 16 * 5 * 5, out_features = 256)
+    self$dropout1 <- nn_dropout(p = 0.6)     # add dropout after fc1
+    self$fc2 <- nn_linear(in_features = 256, out_features = 512) # linear activation
+    self$dropout2 <- nn_dropout(p = 0.6)     # add dropout after fc2
+    self$fc3 <- nn_linear(in_features = 512, out_features = num_classes) # relu before final output
+    self$relu <- nn_relu()
+  },
+  
+  forward = function(x) {
+    x <- self$relu(self$conv1(x))
+    x <- self$pool(x)
+    x <- self$relu(self$conv2(x))
+    x <- self$pool2(x)
+    x <- torch_flatten(x, start_dim = 2)
+    x <- self$relu(self$fc1(x))
+    x <- self$dropout1(x) 
+    x <- self$relu(self$fc2(x))
+    x <- self$dropout2(x)
+    x <- self$fc3(x)
+    return(x)
+  }
+)
+
+# get # of graphical classes to create label instance 
+num_graphical_classes <- length(unique(as_array(graphical_labels_tensor_filtered)))
+cat("Number of graphical classes:", num_graphical_classes, "\n")
+graphical_model <- GraphicalCNN(num_graphical_classes)
+
+# set graph for loss function w learning rate 
+loss_fn_graph <- nn_cross_entropy_loss()
+optimizer_graph <- optim_sgd(graphical_model$parameters, lr = 0.06)
+
+# create dataset and dataloader for training 
+train_ds_graphical <- tensor_dataset(train_X, train_graphical_y)
+train_dl_graphical <- dataloader(train_ds_graphical, batch_size = 9, shuffle = TRUE)
+```
+
+```{r}
+# setup training loop
+# initalize loss and accuracy over epochs
+epochs <- 100
+loss_history_graph <- numeric(epochs)
+accuracy_history_graph <- numeric(epochs)
+
+# save test labels to array
+test_graph_y_arr <- as_array(test_graphical_y)
+
+for (epoch in 1:epochs) { # initialize training mode 
+  graphical_model$train()
+  total_loss <- 0
+  
+  # set up training loop 
+  coro::loop(for (batch in train_dl_graphical) {
+    optimizer_graph$zero_grad()
+    input <- batch[[1]]
+    target <- batch[[2]]
+    
+    # forward pass 
+    output <- graphical_model(input)
+    
+    # compute loss and back prop
+    loss <- loss_fn_graph(output, target)
+    loss$backward()
+    
+    # update parameters
+    optimizer_graph$step()
+    
+    # find total loss 
+    total_loss <- total_loss + loss$item()
+  })
+  
+  # store avg training loss 
+  avg_loss <- total_loss / length(train_dl_graphical)
+  loss_history_graph[epoch] <- avg_loss
+  
+  # create eval for current epoch
+  graphical_model$eval()
+  test_output <- graphical_model(test_X)
+  pred <- test_output$argmax(dim = 2)$squeeze()
+  
+  # calculate accuracy
+  current_accuracy <- mean(as_array(pred) == test_graph_y_arr)
+  accuracy_history_graph[epoch] <- current_accuracy
+  
+  # print for each epoch
+  cat(sprintf("Graphical Model - Epoch %d/%d - Loss: %.4f - Test Accuracy: %.4f\n",
+              epoch, epochs, avg_loss, current_accuracy))
+}
+
+# side by side plot for loss and accuracy 
+par(mfrow = c(1, 2))
+plot(1:epochs, loss_history_graph, type = "b", col = "red",
+     xlab = "Epoch", ylab = "Loss", main = "Graphical Model Training Loss")
+plot(1:epochs, accuracy_history_graph, type = "b", col = "blue",
+     xlab = "Epoch", ylab = "Test Accuracy", main = "Graphical Model Test Accuracy")
+
+```
+
+```{r}
+# model outputs on test set
+final_output <- graphical_model(test_X)
+
+# get predicted labels
+final_pred <- final_output$argmax(dim = 2)$squeeze()
+
+# convert predictions and true labels to R arrays
+final_pred_arr <- as_array(final_pred)
+test_graph_y_arr <- as_array(test_graphical_y)
+
+# calculate accuracy
+final_accuracy <- mean(final_pred_arr == test_graph_y_arr)
+
+# print final accuracy for graphical model
+cat(sprintf("Final Graphical Model Test Accuracy: %.4f\n", final_accuracy))
+```
+
+
